@@ -11,7 +11,7 @@ pipeline {
     // This assumes your Nexus credentials ID is named 'nexus-creds'.
     NEXUS_CREDS_ID = 'nexus-creds'
     // This can be a variable or a hardcoded URL.
-    NEXUS_URL = 'http://192.168.1.100:8081/repository/maven-releases/'
+    NEXUS_URL = 'http://192.168.1.100:8081/repository/maven-releases-test/'
   }
   stages {
     stage('Checkout') {
