@@ -1,0 +1,173 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Python Tests + Coverage
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Run Python tests with coverage
+        run: pytest --maxfail=1 --disable-warnings -q --cov=src --cov-report=xml
+
+      # Node.js Tests + Coverage
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+      - name: Install Node.js dependencies
+        run: npm install
+      - name: Run Node.js tests with coverage
+        run: npm test -- --coverage --coverageReporters=lcov
+
+      # SonarQube Analysis
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        with:
+          args: >
+            -Dsonar.projectKey=myapp
+            -Dsonar.sources=.
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  docker-build:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Nexus Docker Registry
+        run: echo "${{ secrets.NEXUS_PASS }}" | docker login nexus.example.com:5000 -u ${{ secrets.NEXUS_USER }} --password-stdin
+
+      - name: Build Docker image
+        run: |
+          GIT_SHA=$(git rev-parse --short=8 HEAD)
+          IMAGE_TAG=myapp:${{ github.run_number }}-${GIT_SHA}
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          docker build -t nexus.10.10.10.100.com:5000/$IMAGE_TAG .
+
+      - name: Push Docker image to Nexus
+        run: docker push nexus.10.10.10.100.com:5000/${{ env.IMAGE_TAG }}
+
+      - name: Save metadata to S3
+        run: |
+          echo "${{ env.IMAGE_TAG }}" > image.txt
+          aws s3 cp image.txt s3://my-artifacts-bucket/myapp/image-${{ github.run_number }}.txt
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  deploy-dev:
+    needs: docker-build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+
+      - name: Deploy to Dev
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace dev \
+            --set image.repository=nexus.10.10.10.100.com:5000/myapp \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            -f helm/myapp/values-dev.yaml
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA_DEV }}
+
+  deploy-staging:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      # Enable required approval from GitHub UI
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+
+      - name: Deploy to Staging
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace staging \
+            --set image.repository=nexus.10.10.10.100.com:5000/myapp \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            -f helm/myapp/values-staging.yaml
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA_STAGING }}
+
+  deploy-prod:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      #Enable required approval from GitHub UI
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+
+      - name: Canary Deploy to Production
+        run: |
+          set -e
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace prod \
+            --set image.repository=nexus.10.10.10.100.com:5000/myapp \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set replicaCountStable=3 \
+            --set replicaCountCanary=1 \
+            -f helm/myapp/values-prod.yaml
+
+          kubectl --namespace prod rollout status deployment/myapp-canary --timeout=60s
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA_PROD }}
+
+      - name: Promote Canary to Full Production
+        if: success()
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace prod \
+            --set image.repository=nexus.10.10.10.100.com:5000/myapp \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set replicaCountStable=0 \
+            --set replicaCountCanary=4 \
+            -f helm/myapp/values-prod.yaml
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA_PROD }}
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "Production deployment failed. Rolling back..."
+          helm rollback myapp 1 --namespace prod
+        env:
+          KUBECONFIG: ${{ secrets.KUBE_CONFIG_DATA_PROD }}
